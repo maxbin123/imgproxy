@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -8,8 +10,10 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"time"
 
+	"github.com/hashicorp/golang-lru"
 	"github.com/imgproxy/imgproxy/v2/imagemeta"
 )
 
@@ -29,6 +33,8 @@ var (
 const msgSourceImageIsUnreachable = "Source image is unreachable"
 
 var downloadBufPool *bufPool
+
+var l *lru.ARCCache
 
 type limitReader struct {
 	r    io.Reader
@@ -91,6 +97,8 @@ func initDownloading() error {
 		Timeout:   time.Duration(conf.DownloadTimeout) * time.Second,
 		Transport: transport,
 	}
+
+	l, _ = lru.NewARC(500)
 
 	downloadBufPool = newBufPool("download", conf.Concurrency, conf.DownloadBufferSize)
 
@@ -159,25 +167,53 @@ func readAndCheckImage(r io.Reader, contentLength int) (*imageData, error) {
 }
 
 func requestImage(imageURL string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", imageURL, nil)
-	if err != nil {
-		return nil, newError(404, err.Error(), msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+
+	if body, _ := l.Get(imageURL); body != nil {
+		fmt.Println(imageURL + " from cache!")
+		r := bufio.NewReader(bytes.NewReader(body.([]byte)))
+		res, err := http.ReadResponse(r, nil)
+		if err != nil {
+			return res, newError(404, err.Error(), msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+		}
+
+		if res.StatusCode != 200 {
+			body, _ := ioutil.ReadAll(res.Body)
+			msg := fmt.Sprintf("Can't download image; Status: %d; %s", res.StatusCode, string(body))
+			return res, newError(404, msg, msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+		}
+
+		return res, nil
+	} else {
+		req, err := http.NewRequest("GET", imageURL, nil)
+		if err != nil {
+			return nil, newError(404, err.Error(), msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+		}
+
+		req.Header.Set("User-Agent", conf.UserAgent)
+
+		res, _ := downloadClient.Do(req)
+
+		body, err := httputil.DumpResponse(res, true)
+		l.Add(imageURL, body)
+
+		if err != nil {
+			msg := fmt.Sprintf("Can't dump response")
+			return res, newError(404, msg, msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+		}
+
+		if err != nil {
+			return res, newError(404, err.Error(), msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+		}
+
+		if res.StatusCode != 200 {
+			body, _ := ioutil.ReadAll(res.Body)
+			msg := fmt.Sprintf("Can't download image; Status: %d; %s", res.StatusCode, string(body))
+			return res, newError(404, msg, msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
+		}
+
+		return res, nil
 	}
 
-	req.Header.Set("User-Agent", conf.UserAgent)
-
-	res, err := downloadClient.Do(req)
-	if err != nil {
-		return res, newError(404, err.Error(), msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
-	}
-
-	if res.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(res.Body)
-		msg := fmt.Sprintf("Can't download image; Status: %d; %s", res.StatusCode, string(body))
-		return res, newError(404, msg, msgSourceImageIsUnreachable).SetUnexpected(conf.ReportDownloadingErrors)
-	}
-
-	return res, nil
 }
 
 func downloadImage(ctx context.Context) (context.Context, context.CancelFunc, error) {
