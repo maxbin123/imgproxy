@@ -1,4 +1,4 @@
-module github.com/imgproxy/imgproxy/v2
+module github.com/maxbin123/imgproxy/v2
 
 go 1.13
 
