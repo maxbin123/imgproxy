@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -8,8 +10,10 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"time"
 
+	"github.com/hashicorp/golang-lru"
 	"github.com/imgproxy/imgproxy/v2/imagemeta"
 )
 
@@ -29,6 +33,8 @@ var (
 const msgSourceImageIsUnreachable = "Source image is unreachable"
 
 var downloadBufPool *bufPool
+
+var l *lru.ARCCache
 
 type limitReader struct {
 	r    io.Reader
@@ -91,6 +97,8 @@ func initDownloading() error {
 		Timeout:   time.Duration(conf.DownloadTimeout) * time.Second,
 		Transport: transport,
 	}
+
+	l, _ = lru.NewARC(500)
 
 	downloadBufPool = newBufPool("download", conf.Concurrency, conf.DownloadBufferSize)
 
@@ -192,12 +200,27 @@ func downloadImage(ctx context.Context) (context.Context, context.CancelFunc, er
 		defer startPrometheusDuration(prometheusDownloadDuration)()
 	}
 
-	res, err := requestImage(imageURL)
+	var res *http.Response
+	var err error
+
+	if cached, _ := l.Get(imageURL); cached != nil {
+		fmt.Println(imageURL + " from cache!")
+		r := bufio.NewReader(bytes.NewReader(cached.([]byte)))
+		res, err = http.ReadResponse(r, nil)
+		if err != nil {
+			return ctx, func() {}, err
+		}
+	} else {
+		res, err = requestImage(imageURL)
+		acache, _ := httputil.DumpResponse(res, true)
+		l.Add(imageURL, acache)
+		if err != nil {
+			return ctx, func() {}, err
+		}
+	}
+
 	if res != nil {
 		defer res.Body.Close()
-	}
-	if err != nil {
-		return ctx, func() {}, err
 	}
 
 	imgdata, err := readAndCheckImage(res.Body, int(res.ContentLength))
